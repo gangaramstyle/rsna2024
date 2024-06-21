@@ -23,6 +23,9 @@ def always(val):
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
 
+def triple(t):
+    return t if isinstance(t, tuple) else (t, t, t)
+
 def divisible_by(numer, denom):
     return (numer % denom) == 0
 
@@ -48,10 +51,10 @@ def group_images_by_max_seq_len(
     for image in images:
         assert isinstance(image, Tensor)
 
-        image_dims = image.shape[-2:]
-        ph, pw = map(lambda t: t // patch_size, image_dims)
+        image_dims = image.shape[-3:]
+        pd, ph, pw = [dim // p_val for dim, p_val in zip(image_dims, patch_size)]
 
-        image_seq_len = (ph * pw)
+        image_seq_len = (pd * ph * pw)
         image_seq_len = int(image_seq_len * (1 - calc_token_dropout(*image_dims)))
 
         assert image_seq_len <= max_seq_len, f'image with dimensions {image_dims} exceeds maximum sequence length'
@@ -184,9 +187,10 @@ class Transformer(nn.Module):
         return self.norm(x)
 
 class NaViT(nn.Module):
-    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0., token_dropout_prob = None):
+    def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 1, dim_head = 64, dropout = 0., emb_dropout = 0., token_dropout_prob = None):
         super().__init__()
-        image_height, image_width = pair(image_size)
+        image_depth, image_height, image_width = triple(image_size)
+        patch_depth, patch_height, patch_width = triple(patch_size)
 
         # what percent of tokens to dropout
         # if int or float given, then assume constant dropout prob
@@ -204,13 +208,14 @@ class NaViT(nn.Module):
 
         # calculate patching related stuff
 
-        assert divisible_by(image_height, patch_size) and divisible_by(image_width, patch_size), 'Image dimensions must be divisible by the patch size.'
+        assert divisible_by(image_depth, patch_depth) and divisible_by(image_height, patch_height) and divisible_by(image_width, patch_width), 'Image dimensions must be divisible by the patch size.'
 
-        patch_height_dim, patch_width_dim = (image_height // patch_size), (image_width // patch_size)
-        patch_dim = channels * (patch_size ** 2)
+        patch_depth_dim, patch_height_dim, patch_width_dim = (image_depth // patch_depth), (image_height // patch_height), (image_width // patch_width)
+        print(patch_depth_dim, patch_height_dim, patch_width_dim)
+        patch_dim = channels * (patch_depth * patch_height * patch_width)
 
         self.channels = channels
-        self.patch_size = patch_size
+        self.patch_size = triple(patch_size)
 
         self.to_patch_embedding = nn.Sequential(
             LayerNorm(patch_dim),
@@ -218,6 +223,7 @@ class NaViT(nn.Module):
             LayerNorm(dim),
         )
 
+        self.pos_embed_depth = nn.Parameter(torch.randn(patch_depth_dim, dim))
         self.pos_embed_height = nn.Parameter(torch.randn(patch_height_dim, dim))
         self.pos_embed_width = nn.Parameter(torch.randn(patch_width_dim, dim))
 
@@ -279,19 +285,21 @@ class NaViT(nn.Module):
             image_ids = torch.empty((0,), device = device, dtype = torch.long)
 
             for image_id, image in enumerate(images):
-                assert image.ndim ==3 and image.shape[0] == c
-                image_dims = image.shape[-2:]
-                assert all([divisible_by(dim, p) for dim in image_dims]), f'height and width {image_dims} of images must be divisible by patch size {p}'
+                assert image.ndim == 4 and image.shape[0] == c
 
-                ph, pw = map(lambda dim: dim // p, image_dims)
+                image_dims = image.shape[-3:]
+                assert all([divisible_by(dim, p_val) for dim, p_val in zip(image_dims, p)]), f'depth, height, and width {image_dims} of images must be divisible by patch size {p}'
+
+                pd, ph, pw = [dim // p_val for dim, p_val in zip(image_dims, p)]
 
                 pos = torch.stack(torch.meshgrid((
+                    arange(pd),
                     arange(ph),
                     arange(pw)
-                ), indexing = 'ij'), dim = -1)
+                )), dim = -1)
 
-                pos = rearrange(pos, 'h w c -> (h w) c')
-                seq = rearrange(image, 'c (h p1) (w p2) -> (h w) (c p1 p2)', p1 = p, p2 = p)
+                pos = rearrange(pos, 'd h w c -> (d h w) c')
+                seq = rearrange(image, 'c (d p1) (h p2) (w p3) -> (d h w) (c p1 p2 p3)', p1 = p[0], p2 = p[1], p3 = p[2])
 
                 seq_len = seq.shape[-2]
 
@@ -323,7 +331,7 @@ class NaViT(nn.Module):
         attn_mask = rearrange(batched_image_ids, 'b i -> b 1 i 1') == rearrange(batched_image_ids, 'b j -> b 1 1 j')
         attn_mask = attn_mask & rearrange(key_pad_mask, 'b j -> b 1 1 j')
 
-        # combine patched images as well as the patched width / height positions for 2d positional embedding
+        # combine patched images as well as the patched depth / width / height positions for 3d positional embedding
 
         patches = pad_sequence(batched_sequences)
         patch_positions = pad_sequence(batched_positions)
@@ -336,14 +344,17 @@ class NaViT(nn.Module):
 
         x = self.to_patch_embedding(patches)        
 
-        # factorized 2d absolute positional embedding
+        # factorized 3d absolute positional embedding
 
-        h_indices, w_indices = patch_positions.unbind(dim = -1)
+        d_indices, h_indices, w_indices = patch_positions.unbind(dim = -1)
 
+        # if there is interest in doing other forms of position embeddings, this is the place to do it
+        d_pos = self.pos_embed_depth[d_indices]
         h_pos = self.pos_embed_height[h_indices]
         w_pos = self.pos_embed_width[w_indices]
 
-        x = x + h_pos + w_pos
+        # should we add them all or should we concatenate them
+        x = x + d_pos + h_pos + w_pos
 
         # embed dropout
 
