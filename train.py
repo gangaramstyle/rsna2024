@@ -22,25 +22,25 @@ class TrainDataset(IterableDataset):
 
     def __iter__(self):
         for _ in range(self.num_batches):    
-            x, y, z = self._choose_three_numbers_sum_to_18()
+            z, x, y, batch_multiplier = self._choose_three_numbers_sum_to_16()
             batch = []
 
-            for _ in range(self.batch_size):
+            for _ in range(self.batch_size * batch_multiplier):
 
                 zarr_ref = None
                 enough_frames = False
                 while not enough_frames:
                     series_path = random.choice(self.train_series)
                     series = self._get_series_from_path(series_path)
-                    enough_frames = self._enough_dims_in_series(series, (x, y, z))
+                    enough_frames = self._enough_dims_in_series(series, (z, x, y))
 
                     if not enough_frames:
                         continue
 
                     zarr_ref = self._get_zarr_reference(series_path)
 
-                    slice_indices_1 = self._get_frame_indices_for_zarr_reference_and_slice_shape(series, (x, y, z))
-                    slice_indices_2 = self._get_frame_indices_for_zarr_reference_and_slice_shape(series, (x, y, z))
+                    slice_indices_1 = self._get_frame_indices_for_zarr_reference_and_slice_shape(series, (z, x, y))
+                    slice_indices_2 = self._get_frame_indices_for_zarr_reference_and_slice_shape(series, (z, x, y))
 
                     slices_1 = self._get_frames_from_zarr_reference(zarr_ref, slice_indices_1)
                     slices_2 = self._get_frames_from_zarr_reference(zarr_ref, slice_indices_2)
@@ -53,23 +53,29 @@ class TrainDataset(IterableDataset):
                     # check if absolute value of vector[0] is less than 2
                     if abs(vector[0]) < 5:
                         enough_frames = False
+                    
+                    if abs(vector[1]) < 5:
+                        enough_frames = False
+                    
+                    if abs(vector[2]) < 5:
+                        enough_frames = False
 
                 vector = [0.0 if value < 0 else 1.0 for value in vector]
 
 
-                batch.append((slices_1, slices_2, [vector[0]]))
+                batch.append((slices_1, slices_2, vector))
 
             yield tuple(np.stack(t) for t in zip(*batch))
 
     def _get_series_from_path(self, path):
         return int(path.split('/')[-1].split(".")[0])
 
-    def _choose_three_numbers_sum_to_18(self, min=3):
-        x = random.randint(0, 5)
-        y = random.randint(9 - x, 9)
-        z = 18 - x - y
-        return 1, 256, 256
-        return 2**x, 2**y, 2**z
+    def _choose_three_numbers_sum_to_16(self):
+        x = random.randint(7, 8)
+        y = random.randint(7, 8)
+        z = random.randint(0, 16 - x - y)
+        b = 16 - x - y - z
+        return 2**z, 2**x, 2**y, 2**b
 
     def _get_list_of_valid_studies(self):
         # Implement logic to get the list of valid studies
@@ -85,7 +91,14 @@ class TrainDataset(IterableDataset):
         else:
             z = zarr[:]
         z = z - np.mean(z)
-        z = z/np.std(z)
+
+        try:
+            std = np.std(z)
+        except:
+            std = 1.0
+            print("stdev is 0, not dividing by stdev")
+        z = z/std
+
         return np.expand_dims(z, axis=0)
 
     def _get_frame_indices_for_zarr_reference_and_slice_shape(self, series_id, slice_shape):
@@ -130,7 +143,7 @@ class SiameseNetwork(nn.Module):
         self.trunk = nn.Sequential(
             nn.Linear(768*2, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 1),
+            nn.Linear(256, 3),
         )
 
         self.sigmoid = nn.Sigmoid()
@@ -143,7 +156,7 @@ class SiameseNetwork(nn.Module):
 
 
     def forward_once(self, x):
-        output = self.branch(x, group_images = True, group_max_seq_len = 512)
+        output = self.branch(x, group_images = True, group_max_seq_len = 256)
         return output
 
     def forward(self, input1, input2):
@@ -182,9 +195,23 @@ class EndToEnd(L.LightningModule):
         fo = self(inputs_1, inputs_2)
 
         #r_loss = self.recon_loss(autoenc_v1, og_inputs_1[:, 0:1, :, :])
+        if (fo != fo).any():
+            print("Nan detected")
+            print(fo.shape)
+            print(inputs_1.shape)
+            print(inputs_2.shape)
+            print(label.shape)
+
+            nan_indices = torch.any(torch.isnan(fo), dim=1)
+            
+            fo = fo[~nan_indices]
+            label = label[~nan_indices]
+            print(fo.shape)
+
         fo_loss = self.loss(fo, label)
         self.log("loss", fo_loss, prog_bar=True)
-        total_loss =  fo_loss
+        total_loss = fo_loss
+
         return total_loss
 
     def configure_optimizers(self):
