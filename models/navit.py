@@ -189,6 +189,7 @@ class Transformer(nn.Module):
 class NaViT(nn.Module):
     def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels = 1, dim_head = 64, dropout = 0., emb_dropout = 0., token_dropout_prob = None):
         super().__init__()
+        self.dim = dim
         image_depth, image_height, image_width = triple(image_size)
         patch_depth, patch_height, patch_width = triple(patch_size)
 
@@ -223,9 +224,9 @@ class NaViT(nn.Module):
             LayerNorm(dim),
         )
 
-        self.pos_embed_depth = nn.Parameter(torch.randn(patch_depth_dim, dim))
-        self.pos_embed_height = nn.Parameter(torch.randn(patch_height_dim, dim))
-        self.pos_embed_width = nn.Parameter(torch.randn(patch_width_dim, dim))
+        # self.pos_embed_depth = nn.Parameter(torch.randn(patch_depth_dim, dim))
+        # self.pos_embed_height = nn.Parameter(torch.randn(patch_height_dim, dim))
+        # self.pos_embed_width = nn.Parameter(torch.randn(patch_width_dim, dim))
 
         self.dropout = nn.Dropout(emb_dropout)
 
@@ -248,6 +249,39 @@ class NaViT(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def create_sin_cos_embeddings_3d(self, image_shape, voxel_size=[1.0, 1.0, 1.0], d=768, n=1000):
+        device = self.device
+        arange = partial(torch.arange, device = device)
+
+        pos = torch.stack(torch.meshgrid((
+            arange(image_shape[0]),
+            arange(image_shape[1]),
+            arange(image_shape[2])
+        )), dim = -1)
+
+        z = pos[:,:,:,0:1].float() - ((pos.shape[0] - 1)/2.0)
+        x = pos[:,:,:,1:2].float() - ((pos.shape[1] - 1)/2.0)
+        y = pos[:,:,:,2:3].float() - ((pos.shape[2] - 1)/2.0)
+
+        z = z * voxel_size[0]
+        x = x * voxel_size[1]
+        y = y * voxel_size[2]
+
+        denominators = torch.pow(n, 2*arange(0, d//6)/d) # 10000^(2i/d_model), i is the index of embedding
+
+        z = torch.matmul(z, denominators.unsqueeze(0))
+        x = torch.matmul(x, denominators.unsqueeze(0))
+        y = torch.matmul(y, denominators.unsqueeze(0))
+
+        z_s = torch.sin(z)
+        z_c = torch.cos(z)
+        x_s = torch.sin(x)
+        x_c = torch.cos(x)
+        y_s = torch.sin(y)
+        y_c = torch.cos(y)
+        
+        return torch.cat((z_s, z_c, x_s, x_c, y_s, y_c), dim=3)
 
     def forward(
         self,
@@ -292,12 +326,7 @@ class NaViT(nn.Module):
 
                 pd, ph, pw = [dim // p_val for dim, p_val in zip(image_dims, p)]
 
-                pos = torch.stack(torch.meshgrid((
-                    arange(pd),
-                    arange(ph),
-                    arange(pw)
-                )), dim = -1)
-
+                pos = self.create_sin_cos_embeddings_3d((pd, ph, pw), d=self.dim)
                 pos = rearrange(pos, 'd h w c -> (d h w) c')
                 seq = rearrange(image, 'c (d p1) (h p2) (w p3) -> (d h w) (c p1 p2 p3)', p1 = p[0], p2 = p[1], p3 = p[2])
 
@@ -346,15 +375,9 @@ class NaViT(nn.Module):
 
         # factorized 3d absolute positional embedding
 
-        d_indices, h_indices, w_indices = patch_positions.unbind(dim = -1)
+        #d_indices, h_indices, w_indices = patch_positions.unbind(dim = -1)
 
-        # if there is interest in doing other forms of position embeddings, this is the place to do it
-        d_pos = self.pos_embed_depth[d_indices]
-        h_pos = self.pos_embed_height[h_indices]
-        w_pos = self.pos_embed_width[w_indices]
-
-        # should we add them all or should we concatenate them
-        x = x + d_pos + h_pos + w_pos
+        x = x + patch_positions
 
         # embed dropout
 
@@ -397,4 +420,10 @@ class NaViT(nn.Module):
 
         x = self.to_latent(x)
 
-        return self.mlp_head(x)
+        # print(x.shape)
+
+        # x = self.mlp_head(x)
+
+        # print(x.shape)
+
+        return x

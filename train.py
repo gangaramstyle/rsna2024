@@ -9,37 +9,16 @@ import torch.nn as nn
 import torch
 from models.navit import NaViT
 from torch.nn import BCELoss
-
-root_dir = '/cbica/home/gangarav/projects/rsna_lumbar/raw'
-study_paths = []
-series_paths = []
-
-for study_name in os.listdir(root_dir):
-    study_path = os.path.join(root_dir, study_name)
-    study_paths.append(study_path)
-
-    for series_name in os.listdir(study_path):
-        series_path = os.path.join(study_path, series_name)
-        series_paths.append(series_path)
-
-def load_dicom(path):
-    files = [(pydicom.dcmread(f"{path}/{f}").InstanceNumber, f) for f in os.listdir(f"{path}")]
-    files = sorted(files,  key=lambda x: x[0])
-    frames = []
-    for _, f in files:
-        ds = pydicom.dcmread(f"{path}/{f}")
-        frames.append(np.expand_dims(ds.pixel_array, (0)))
-    s = np.vstack(frames)
-    return s.astype(np.float32), np.round(ds.ImageOrientationPatient, 0)
-
+import pandas as pd
 
 
 class TrainDataset(IterableDataset):
-    def __init__(self, train_studies):
+    def __init__(self, train_series, batch_size=10):
         self.num_batches = 1000
-        self.batch_size = 100
+        self.batch_size = batch_size
+        self.series_metadata = pd.read_json('/cbica/home/gangarav/projects/rsna_lumbar/axial_t2_data.json')
 
-        self.studies = train_studies
+        self.train_series = train_series
 
     def __iter__(self):
         for _ in range(self.num_batches):    
@@ -51,26 +30,39 @@ class TrainDataset(IterableDataset):
                 zarr_ref = None
                 enough_frames = False
                 while not enough_frames:
-                    study = random.choice(self.studies)
-                    zarr_ref = self._get_zarr_reference(study)
-                    enough_frames = self._enough_frames_in_zarr_reference(zarr_ref, (x, y, z))
+                    series_path = random.choice(self.train_series)
+                    series = self._get_series_from_path(series_path)
+                    enough_frames = self._enough_dims_in_series(series, (x, y, z))
 
-                slice_indices_1 = self._get_frame_indices_for_zarr_reference_and_slice_shape(zarr_ref, (x, y, z))
-                slice_indices_2 = self._get_frame_indices_for_zarr_reference_and_slice_shape(zarr_ref, (x, y, z))
+                    if not enough_frames:
+                        continue
 
-                slices_1 = self._get_frames_from_zarr_reference(zarr_ref, slice_indices_1)
-                slices_2 = self._get_frames_from_zarr_reference(zarr_ref, slice_indices_2)
+                    zarr_ref = self._get_zarr_reference(series_path)
 
-                midpoint_1 = np.array([np.mean(i_pairs) for i_pairs in slice_indices_1])
-                midpoint_2 = np.array([np.mean(i_pairs) for i_pairs in slice_indices_2])
+                    slice_indices_1 = self._get_frame_indices_for_zarr_reference_and_slice_shape(series, (x, y, z))
+                    slice_indices_2 = self._get_frame_indices_for_zarr_reference_and_slice_shape(series, (x, y, z))
 
-                vector = midpoint_1 - midpoint_2
+                    slices_1 = self._get_frames_from_zarr_reference(zarr_ref, slice_indices_1)
+                    slices_2 = self._get_frames_from_zarr_reference(zarr_ref, slice_indices_2)
 
-                # vector = [0.0 if vector[0] < 0 else 1.0]
+                    midpoint_1 = np.array([np.mean(i_pairs) for i_pairs in slice_indices_1])
+                    midpoint_2 = np.array([np.mean(i_pairs) for i_pairs in slice_indices_2])
+
+                    vector = midpoint_1 - midpoint_2
+
+                    # check if absolute value of vector[0] is less than 2
+                    if abs(vector[0]) < 5:
+                        enough_frames = False
+
+                vector = [0.0 if value < 0 else 1.0 for value in vector]
+
 
                 batch.append((slices_1, slices_2, [vector[0]]))
 
             yield tuple(np.stack(t) for t in zip(*batch))
+
+    def _get_series_from_path(self, path):
+        return int(path.split('/')[-1].split(".")[0])
 
     def _choose_three_numbers_sum_to_18(self, min=3):
         x = random.randint(0, 5)
@@ -83,23 +75,23 @@ class TrainDataset(IterableDataset):
         # Implement logic to get the list of valid studies
         pass
 
-    def _get_zarr_reference(self, study):
-        array = None
-        with zarr.DirectoryStore(f'{study}') as store:
-            array = zarr.open(store, mode='r')
-        return array
+    def _get_zarr_reference(self, series_path):
+        return zarr.open(series_path, mode='r')
 
     def _get_frames_from_zarr_reference(self, zarr, slice_list=None):
         if slice_list is not None:
             slices = tuple(slice(start, end) for start, end in slice_list)
-            zarr = zarr[slices]
+            z = zarr[slices]
+        else:
+            z = zarr[:]
+        z = z - np.mean(z)
+        z = z/np.std(z)
+        return np.expand_dims(z, axis=0)
 
-        #T = Resize((256, 256), mode="bilinear")
-        return np.expand_dims(zarr[:], axis=0)
-
-    def _get_frame_indices_for_zarr_reference_and_slice_shape(self, zarr, slice_shape):
+    def _get_frame_indices_for_zarr_reference_and_slice_shape(self, series_id, slice_shape):
         slice_indices = []
-        for axis, size in enumerate(zarr.shape):
+        dims = self._get_dims_from_series(series_id)
+        for axis, size in enumerate(dims):
             if size < slice_shape[axis]:
                 return None
             else:
@@ -107,12 +99,16 @@ class TrainDataset(IterableDataset):
                 slice_indices.append([index, index + slice_shape[axis]])
         return slice_indices
 
-    def _enough_frames_in_zarr_reference(self, zarr, slice_shape):
-        for axis, size in enumerate(zarr.shape):
+    def _get_dims_from_series(self, series_id):
+        row = self.series_metadata.loc[self.series_metadata["series_id"] == series_id]
+        return row.z_dim.values[0], row.x_dim.values[0], row.y_dim.values[0]
+
+    def _enough_dims_in_series(self, series_id, slice_shape):
+        dims = self._get_dims_from_series(series_id)
+        for axis, size in enumerate(dims):
             if size < slice_shape[axis]:
                 return False
         return True
-
 
 
 class SiameseNetwork(nn.Module):
@@ -132,7 +128,7 @@ class SiameseNetwork(nn.Module):
                 #token_dropout_prob = 0.1  # token dropout of 10% (keep 90% of tokens)
             )
         self.trunk = nn.Sequential(
-            nn.Linear(20, 256),
+            nn.Linear(768*2, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 1),
         )
@@ -187,7 +183,7 @@ class EndToEnd(L.LightningModule):
 
         #r_loss = self.recon_loss(autoenc_v1, og_inputs_1[:, 0:1, :, :])
         fo_loss = self.loss(fo, label)
-        self.log("loss", fo_loss)
+        self.log("loss", fo_loss, prog_bar=True)
         total_loss =  fo_loss
         return total_loss
 
@@ -195,37 +191,21 @@ class EndToEnd(L.LightningModule):
         return torch.optim.Adam(list(self.net.parameters()), lr=1e-3)
 
 class DataModule(L.LightningDataModule):
-    def __init__(self):
+    def __init__(self, batch_size):
         super().__init__()
-        self.train_studies = [
-            "/cbica/home/gangarav/rsna24_preprocessed/1012284084.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1012284084.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1243755365.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1252873726.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1705522953.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1709080005.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1792451510.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/1870630737.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/2092806862.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/2526352865.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/2539455828.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/2720025375.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/2883858173.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/3088482668.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/3461716915.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/3775545364.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/4018190332.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/801316590.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/866293114.zarr/",
-            "/cbica/home/gangarav/rsna24_preprocessed/992525108.zarr/",
-        ]
+        self.batch_size = batch_size
+        zarr_dir = '/cbica/home/gangarav/rsna24_preprocessed/'
+        self.train_studies = [f"{zarr_dir}{file}" for file in os.listdir(zarr_dir)]
 
     def train_dataloader(self):
-        dataset = TrainDataset(self.train_studies)
+        dataset = TrainDataset(self.train_studies, self.batch_size)
         dataloader = DataLoader(dataset, batch_size=None, num_workers=4)
         return dataloader
 
-dm = DataModule()
+dm = DataModule(batch_size=10)
 sn = EndToEnd()
-trainer = L.Trainer(max_epochs=10000)
+trainer = L.Trainer(max_epochs=10000, accumulate_grad_batches=100)
+# tuner = Tuner(trainer)
+# tuner.scale_batch_size(sn, datamodule=dm, mode="binsearch")
+
 trainer.fit(sn, datamodule=dm)
